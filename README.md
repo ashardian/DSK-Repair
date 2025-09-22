@@ -1,7 +1,6 @@
 # 🚀 DSK Repair – Intelligent Disk Repair Utility
 
-**Version:** 2.3.0  
-**Author:** @Ashar Dian  
+**Author:** Ashar Dian  
 
 DSK Repair is an advanced disk inspection and repair utility for Linux.  
 It provides both an **interactive menu** and **command-line (CLI) one-shot options**, combining safe diagnostics, conservative repair flows, and optional integration with `ddrescue` for disk imaging.
@@ -28,13 +27,13 @@ It provides both an **interactive menu** and **command-line (CLI) one-shot optio
 
 ---
 
-## 🔧 Installation
+# 🔧 Installation
 
 1. Ensure Python 3.7+ is installed.
 2. Install optional dependencies:
    ```bash
    sudo apt install smartmontools ntfs-3g gddrescue exfat-fuse exfat-utils dosfstools e2fsprogs
-````
+
 
 3. (Optional) Install `colorama` for colored output:
 
