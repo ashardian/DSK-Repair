@@ -6,6 +6,8 @@ DSK Repair is an advanced disk inspection and repair utility for Linux.
 It provides both an **interactive menu** and **command-line (CLI) one-shot options**, combining safe diagnostics, conservative repair flows, and optional integration with `ddrescue` for disk imaging.
 
 ---
+![alt text](https://github.com/ashardian/DSK-repair/blob/main/img/1.png)
+
 
 ## ✨ Features
 
