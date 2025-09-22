@@ -44,7 +44,7 @@ It provides both an **interactive menu** and **command-line (CLI) one-shot optio
 
    ```bash
    git clone https://github.com/ashardian/DSK-Repair.git
-   cd dsk-repair
+   cd DSK-repair
    ```
 5. Make the script executable:
 
