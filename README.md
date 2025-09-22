@@ -1,8 +1,3 @@
-Here’s a **detailed `README.md`** for your tool based on the code in `disk_repair_tool.py`:
-
----
-
-````markdown
 # 🚀 DSK Repair – Intelligent Disk Repair Utility
 
 **Version:** 2.3.0  
