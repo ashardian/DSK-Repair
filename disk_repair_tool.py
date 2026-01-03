@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DSK Repair - Intelligent Disk Repair Utility (final script)
+DSK Repair - Intelligent Disk Repair Utility (v3.0 - Advanced)
 
 Features:
  - Interactive menu + one-shot CLI flags
@@ -8,7 +8,10 @@ Features:
  - Automatic detection of unmounted partitions at startup
  - Interactive selection of partitions by index
  - Conservative repair flows (safe first, confirm before destructive)
- - Supports ext2/3/4, ntfs, exfat/vfat
+ - Supports: ext2/3/4, ntfs, exfat/vfat
+ - [NEW] Supports: XFS, Btrfs
+ - [NEW] Partition Header Backup (Safety)
+ - [NEW] JSON Session Reporting
  - ddrescue integration for imaging
 """
 
@@ -36,6 +39,7 @@ except Exception:
         YELLOW = ""
         CYAN = ""
         MAGENTA = ""
+        BLUE = ""
         RESET = ""
     Fore = _NoColor()
     class _NoStyle:
@@ -43,8 +47,9 @@ except Exception:
     Style = _NoStyle()
 
 # -------------------- config --------------------
-VERSION = "2.3.0"
+VERSION = "3.0.0"
 LOGFILE_DEFAULT = "/var/log/dsk_repair.log"
+SESSION_REPORT_DIR = "/var/log/dsk_repair_sessions"
 
 # -------------------- utilities --------------------
 def run_text(cmd: List[str]) -> Tuple[int, str, str]:
@@ -70,6 +75,18 @@ def safe_write_log(msg: str, logfile: str = LOGFILE_DEFAULT) -> None:
     except Exception:
         pass
 
+def save_session_report(data: Dict) -> str:
+    """Save a detailed JSON report of the repair session."""
+    try:
+        os.makedirs(SESSION_REPORT_DIR, exist_ok=True)
+        filename = f"repair_session_{int(time.time())}.json"
+        filepath = os.path.join(SESSION_REPORT_DIR, filename)
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=4)
+        return filepath
+    except Exception as e:
+        return f"Failed to save report: {e}"
+
 def require_root() -> None:
     if os.geteuid() != 0:
         print(Fore.RED + "❌ Root required for this operation. Please re-run with sudo.")
@@ -80,9 +97,9 @@ def safe_str(x, default: str = "-") -> str:
 
 def banner() -> None:
     print(Fore.MAGENTA + "=" * 60)
-    print(Fore.GREEN + "         🚀 DSK REPAIR 🚀")
+    print(Fore.GREEN + f"         🚀 DSK REPAIR v{VERSION} 🚀")
     print(Fore.RED + "         Made by @Ashar Dian")
-    print(Fore.CYAN + "   Intelligent Disk Utility for Linux")
+    print(Fore.CYAN + "   Intelligent Disk Utility for Linux (Extended)")
     print(Fore.MAGENTA + "=" * 60)
 
 def pretty_header(title: str) -> None:
@@ -190,6 +207,21 @@ def smart_check(device: str) -> Dict:
         results[" ".join(args)] = {"rc": rc, "out": out.strip(), "err": err.strip()}
     return results
 
+def check_dependencies() -> None:
+    required = ["lsblk", "blkid", "mount", "umount"]
+    optional = ["smartctl", "ntfsfix", "ntfs-3g", "e2fsck", "fsck.exfat", "fsck.vfat", "ddrescue", "xfs_repair", "btrfs"]
+    
+    missing = [tool for tool in required if not which(tool)]
+    if missing:
+        print(badge_error(f"CRITICAL: Missing required tools: {', '.join(missing)}"))
+        sys.exit(1)
+        
+    missing_opt = [tool for tool in optional if not which(tool)]
+    if missing_opt:
+        # Just a friendly warning, not an error
+        # print(badge_warn(f"Optional tools missing: {', '.join(missing_opt)} (some features may be limited)"))
+        pass
+
 # -------------------- mount helpers --------------------
 def create_mountpoint(base: str = "/mnt", name: Optional[str] = None) -> str:
     if not name:
@@ -219,23 +251,51 @@ def mount_ntfs_with_ntfs3g(partition: str, mountpoint: str, options: Optional[st
     return rc == 0, (out or "") + (err or "")
 
 # -------------------- repair helpers --------------------
-def repair_ntfs(partition: str, auto_yes: bool = False) -> Dict:
+def backup_header(partition: str, dest_dir: str = "/var/log/dsk_backups") -> str:
+    """Backup the first 16MB of the partition before attempting repair."""
+    os.makedirs(dest_dir, exist_ok=True)
+    fname = f"header_{os.path.basename(partition)}_{int(time.time())}.img"
+    dest_path = os.path.join(dest_dir, fname)
+    print(badge_info(f"Backing up partition header to {dest_path}..."))
+    # using dd to backup first 16MB
+    cmd = ["dd", f"if={partition}", f"of={dest_path}", "bs=1M", "count=16", "status=none"]
+    rc, out, err = run_text(cmd)
+    if rc == 0:
+        return dest_path
+    else:
+        print(badge_warn(f"Header backup failed: {err}"))
+        return ""
+
+def repair_ntfs(partition: str, auto_yes: bool = False, force: bool = False) -> Dict:
     if not which("ntfsfix"):
         return {"error": "ntfsfix not installed"}
     safe_write_log(f"ntfsfix start {partition}")
-    rc, out, err = run_text(["ntfsfix", partition])
+    cmd = ["ntfsfix"]
+    if force:
+        cmd.append("-d") # Clear dirty flag
+    cmd.append(partition)
+    rc, out, err = run_text(cmd)
     return {"rc": rc, "out": out.strip(), "err": err.strip()}
 
-def repair_extfs(partition: str, auto_yes: bool = False) -> Dict:
+def repair_extfs(partition: str, auto_yes: bool = False, force: bool = False) -> Dict:
     if not which("e2fsck"):
         return {"error": "e2fsck not installed"}
+    
+    # Check first
     safe_write_log(f"e2fsck -n {partition}")
     rc, out, err = run_text(["e2fsck", "-n", partition])
     dry_out = out.strip()
-    if "clean" in (dry_out or "").lower() or rc == 0:
+    
+    # If clean and not forced, return
+    if "clean" in (dry_out or "").lower() and rc == 0 and not force:
         return {"status": "filesystem appears clean", "dry_rc": rc, "dry_out": dry_out}
+        
     if auto_yes or input("Run e2fsck -f -y to attempt repairs? [y/N]: ").strip().lower() in ("y", "yes"):
-        rc2, out2, err2 = run_text(["e2fsck", "-f", "-y", partition])
+        cmd = ["e2fsck", "-f", "-y"]
+        if force:
+            cmd.append("-f") # Force checking even if clean
+        cmd.append(partition)
+        rc2, out2, err2 = run_text(cmd)
         return {"rc": rc2, "out": out2.strip(), "err": err2.strip()}
     return {"status": "user declined destructive repair", "dry_rc": rc, "dry_out": dry_out}
 
@@ -244,48 +304,102 @@ def repair_exfat(partition: str, auto_yes: bool = False) -> Dict:
         rc, out, err = run_text(["fsck.exfat", "-n", partition])
         dry_out = out.strip()
         if auto_yes or input("Run fsck.exfat to repair? [y/N]: ").strip().lower() in ("y", "yes"):
-            rc2, out2, err2 = run_text(["fsck.exfat", partition])
+            rc2, out2, err2 = run_text(["fsck.exfat", "-a", partition]) # -a for auto repair
             return {"rc": rc2, "out": out2.strip(), "err": err2.strip()}
         return {"dry_rc": rc, "dry_out": dry_out}
     elif which("fsck.vfat"):
-        rc, out, err = run_text(["fsck.vfat", partition])
-        return {"rc": rc, "out": out.strip(), "err": err.strip(), "note": "used fsck.vfat fallback"}
+        rc, out, err = run_text(["fsck.vfat", "-n", partition])
+        if auto_yes or input("Run fsck.vfat -a to repair? [y/N]: ").strip().lower() in ("y", "yes"):
+             rc2, out2, err2 = run_text(["fsck.vfat", "-a", partition])
+             return {"rc": rc2, "out": out2.strip(), "err": err2.strip(), "note": "used fsck.vfat fallback"}
+        return {"rc": rc, "out": out.strip()}
     else:
         return {"error": "No exFAT/FAT repair tool installed"}
 
+def repair_xfs(partition: str, auto_yes: bool = False) -> Dict:
+    if not which("xfs_repair"):
+        return {"error": "xfs_repair not installed"}
+    
+    # xfs_repair cannot run on mounted filesystems
+    # It also doesn't have a 'dry run' that is safe, checking log is safer
+    print(badge_info("XFS detected. xfs_repair will be run."))
+    
+    if auto_yes or input("Run xfs_repair (must be unmounted)? [y/N]: ").strip().lower() in ("y", "yes"):
+        cmd = ["xfs_repair", partition]
+        rc, out, err = run_text(cmd)
+        return {"rc": rc, "out": out.strip(), "err": err.strip()}
+    return {"status": "aborted by user"}
+
+def repair_btrfs(partition: str, auto_yes: bool = False) -> Dict:
+    if not which("btrfs"):
+        return {"error": "btrfs-progs not installed"}
+    
+    print(badge_info("Btrfs detected. Running 'btrfs check --repair' is dangerous."))
+    print(badge_warn("Only run this if you have backups. Consider mounting safely first."))
+    
+    cmd_check = ["btrfs", "check", partition]
+    rc, out, err = run_text(cmd_check)
+    if rc == 0:
+        return {"status": "filesystem appears clean", "check_out": out.strip()}
+    
+    print(Fore.RED + f"Errors found:\n{out[:500]}...")
+    if auto_yes or input("Run 'btrfs check --repair' (Dangerous)? [y/N]: ").strip().lower() in ("y", "yes"):
+        cmd = ["btrfs", "check", "--repair", partition]
+        rc2, out2, err2 = run_text(cmd)
+        return {"rc": rc2, "out": out2.strip(), "err": err2.strip()}
+    return {"status": "user declined dangerous repair"}
+
 # -------------------- conservative repair flow --------------------
-def repair_flow(partition: str, auto_yes: bool = False, mount_base: str = "/mnt") -> Dict:
+def repair_flow(partition: str, auto_yes: bool = False, force: bool = False, mount_base: str = "/mnt") -> Dict:
     require_root()
     pretty_header(f"Repair Flow: {partition}")
-    result: Dict = {"partition": partition, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+    result: Dict = {"partition": partition, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "force_mode": force}
+    
     if not validate_device_input(partition):
         msg = f"Invalid partition/device: {partition}"
         print(Fore.RED + "❌ " + msg)
         result["error"] = msg
         return result
 
+    # 1. Identify FS
     info = get_partition_info(partition)
     fstype = info.get("TYPE")
     print(Fore.CYAN + f"ℹ️ Detected filesystem: {safe_str(fstype, '-')}")
     result["fstype"] = fstype
 
-    # try read-only mount first
-    mp_ro = create_mountpoint(base=mount_base, name=f"dsk_{os.path.basename(partition)}_ro")
-    print(Fore.CYAN + f"ℹ️ Attempting read-only mount at {mp_ro} ...")
-    ok, out = attempt_mount(partition, mp_ro, options="ro")
-    if ok:
-        print(Fore.GREEN + f"✅ Mounted read-only at {mp_ro}")
-        result["mounted_ro"] = mp_ro
-        return result
-    else:
-        result["mount_ro_error"] = out.strip()
-        safe_write_log(f"mount_ro_failed {partition}: {out.strip()}")
-        print(Fore.RED + "❌ Read-only mount failed.")
+    # 2. Safety: Header Backup
+    if not auto_yes:
+        bk_ans = input("Create safety backup of partition header (16MB)? [Y/n]: ").strip().lower()
+        if bk_ans not in ("n", "no"):
+            bk_path = backup_header(partition)
+            result["header_backup"] = bk_path
 
-    # filesystem-specific repair attempts
+    # 3. Try Read-Only Mount (unless forced to skip)
+    mounted_ro = False
+    if not force:
+        mp_ro = create_mountpoint(base=mount_base, name=f"dsk_{os.path.basename(partition)}_ro")
+        print(Fore.CYAN + f"ℹ️ Attempting read-only mount at {mp_ro} ...")
+        ok, out = attempt_mount(partition, mp_ro, options="ro")
+        if ok:
+            print(Fore.GREEN + f"✅ Mounted read-only at {mp_ro}. Filesystem might be accessible.")
+            result["mounted_ro"] = mp_ro
+            mounted_ro = True
+            if not auto_yes:
+                 if input("Partition mounted RO. Continue with repair anyway? [y/N]: ").strip().lower() not in ("y", "yes"):
+                     print(badge_info("Aborting repair since data is accessible."))
+                     return result
+            # Unmount to proceed with repair
+            run_text(["umount", partition]) 
+        else:
+            result["mount_ro_error"] = out.strip()
+            print(Fore.RED + "❌ Read-only mount failed. Proceeding to repair.")
+    else:
+        print(badge_warn("Force mode enabled: Skipping Read-Only mount check."))
+
+    # 4. Execute Repair based on FS
     if fstype == "ntfs":
-        print(Fore.CYAN + "ℹ️ Running ntfsfix (conservative)...")
-        res = repair_ntfs(partition, auto_yes=auto_yes)
+        print(Fore.CYAN + "ℹ️ Running ntfsfix...")
+        res = repair_ntfs(partition, auto_yes=auto_yes, force=force)
         result["repair"] = res
         # try mounting with ntfs-3g
         mp_rw = create_mountpoint(base=mount_base, name=f"dsk_{os.path.basename(partition)}_rw")
@@ -298,10 +412,9 @@ def repair_flow(partition: str, auto_yes: bool = False, mount_base: str = "/mnt"
             print(Fore.RED + "❌ Mount after ntfsfix failed. Recommendation: connect to Windows and run chkdsk /f /r")
 
     elif fstype in ("ext4", "ext3", "ext2"):
-        print(Fore.CYAN + "ℹ️ Running e2fsck (conservative)...")
-        res = repair_extfs(partition, auto_yes=auto_yes)
+        print(Fore.CYAN + "ℹ️ Running e2fsck...")
+        res = repair_extfs(partition, auto_yes=auto_yes, force=force)
         result["repair"] = res
-        # attempt mount if repair said ok
         mp_rw = create_mountpoint(base=mount_base, name=f"dsk_{os.path.basename(partition)}_rw")
         ok2, out2 = attempt_mount(partition, mp_rw)
         if ok2:
@@ -311,7 +424,7 @@ def repair_flow(partition: str, auto_yes: bool = False, mount_base: str = "/mnt"
             result["mount_after"] = out2.strip()
             print(Fore.RED + "❌ Mount failed after repair.")
 
-    elif fstype in ("exfat", "vfat"):
+    elif fstype in ("exfat", "vfat", "fat32"):
         print(Fore.CYAN + "ℹ️ Running exFAT/FAT repair helper...")
         res = repair_exfat(partition, auto_yes=auto_yes)
         result["repair"] = res
@@ -322,13 +435,31 @@ def repair_flow(partition: str, auto_yes: bool = False, mount_base: str = "/mnt"
             result["mounted"] = mp_rw
         else:
             result["mount_after"] = out2.strip()
-            print(Fore.RED + "❌ Mount failed after exFAT repair.")
+
+    elif fstype == "xfs":
+        res = repair_xfs(partition, auto_yes=auto_yes)
+        result["repair"] = res
+        # XFS mount
+        mp_rw = create_mountpoint(base=mount_base, name=f"dsk_{os.path.basename(partition)}_rw")
+        ok2, out2 = attempt_mount(partition, mp_rw)
+        if ok2:
+            print(Fore.GREEN + f"✅ Mounted at {mp_rw}")
+            result["mounted"] = mp_rw
+
+    elif fstype == "btrfs":
+        res = repair_btrfs(partition, auto_yes=auto_yes)
+        result["repair"] = res
+        mp_rw = create_mountpoint(base=mount_base, name=f"dsk_{os.path.basename(partition)}_rw")
+        ok2, out2 = attempt_mount(partition, mp_rw)
+        if ok2:
+            print(Fore.GREEN + f"✅ Mounted at {mp_rw}")
+            result["mounted"] = mp_rw
 
     else:
         print(Fore.YELLOW + "⚠️ Unknown or unsupported filesystem type. Consider imaging with ddrescue.")
         result["note"] = "unsupported fs or unknown type"
 
-    # collect some diagnostics
+    # 5. Diagnostics
     parent = get_parent_disk(partition)
     if parent:
         dm = check_dmesg_for_device(parent)
@@ -336,6 +467,10 @@ def repair_flow(partition: str, auto_yes: bool = False, mount_base: str = "/mnt"
             result["dmesg"] = dm
         sm = smart_check(parent)
         result["smart"] = sm
+
+    # 6. Report
+    report_path = save_session_report(result)
+    print(badge_info(f"Session report saved to: {report_path}"))
 
     return result
 
@@ -435,6 +570,9 @@ def detect_unmounted_partitions() -> None:
     if os.geteuid() != 0:
         print(Fore.YELLOW + "⚠️ Not running as root. To attempt repairs now, re-run the tool with sudo.")
         return
+    
+    # Prompt user once for all
+    print(Fore.MAGENTA + "Quick Actions:")
     for p in unmounted:
         ans = input(f"Attempt repair on {p}? [y/N]: ").strip().lower()
         if ans in ("y", "yes"):
@@ -445,6 +583,7 @@ def detect_unmounted_partitions() -> None:
 # -------------------- interactive menu --------------------
 def interactive_menu() -> None:
     banner()
+    check_dependencies()
     detect_unmounted_partitions()
     while True:
         print("\n=== " + Fore.MAGENTA + "DSK Repair Menu" + Fore.RESET + " ===")
@@ -455,8 +594,9 @@ def interactive_menu() -> None:
         print("5) Repair and Mount a partition")
         print("6) Create disk image with ddrescue")
         print("7) Mount a partition manually")
-        print("8) Exit")
-        choice = input(Fore.CYAN + "Select an option [1-8]: " + Fore.RESET).strip()
+        print("8) FORCE Repair (Ignore Safety Checks)")
+        print("9) Exit")
+        choice = input(Fore.CYAN + "Select an option [1-9]: " + Fore.RESET).strip()
 
         try:
             if choice == "1":
@@ -542,11 +682,21 @@ def interactive_menu() -> None:
                     print(badge_info("Tip: try option 5 to attempt repair then mount."))
 
             elif choice == "8":
+                if os.geteuid() != 0:
+                    print(Fore.RED + "❌ Repairing requires root. Re-run with sudo.")
+                    continue
+                print(Fore.RED + "⚠️  FORCE REPAIR MODE: This will ignore read-only checks and force fsck.")
+                part = choose_partition("Choose partition to FORCE repair")
+                if part:
+                    res = repair_flow(part, auto_yes=False, force=True)
+                    print(json.dumps(res, indent=2))
+
+            elif choice == "9":
                 print(badge_info("Exiting DSK Repair. Goodbye!"))
                 break
 
             else:
-                print(badge_warn("Invalid choice — enter a number 1-8"))
+                print(badge_warn("Invalid choice — enter a number 1-9"))
 
         except KeyboardInterrupt:
             print("\n" + badge_warn("Interrupted by user — returning to menu"))
@@ -564,6 +714,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--image", nargs=2, metavar=("SRC", "DEST"), help="Create image of SRC to DEST using ddrescue (requires root)")
     p.add_argument("--mapfile", help="Mapfile for ddrescue (used with --image)")
     p.add_argument("--yes", action="store_true", help="Assume yes to prompts")
+    p.add_argument("--force", action="store_true", help="Force repair even if dirty bit isn't set (bypass checks)")
     return p
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -602,7 +753,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         return
     if args.repair:
         require_root()
-        res = repair_flow(args.repair, auto_yes=args.yes)
+        res = repair_flow(args.repair, auto_yes=args.yes, force=args.force)
         print(json.dumps(res, indent=2))
         return
     if args.image:
@@ -620,4 +771,3 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print(badge_error("\nInterrupted by user"))
-
